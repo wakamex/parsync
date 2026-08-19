@@ -4,9 +4,11 @@ pub mod delta;
 pub mod hashing;
 #[cfg(target_os = "linux")]
 pub mod rdma;
+pub mod push_prototype;
 pub mod remote;
 pub mod remote_helper;
 pub mod state;
 pub mod sync;
 
 pub use sync::{run_sync, RunSummary};
+

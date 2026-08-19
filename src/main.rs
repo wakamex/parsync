@@ -23,6 +23,16 @@ fn main() -> ExitCode {
             }
         };
     }
+    if std::env::args().any(|arg| arg == "--prototype-push" || arg == "--internal-push-prototype") {
+        let args: Vec<String> = std::env::args().collect();
+        return match parsync::push_prototype::run_cli(&args) {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                ExitCode::from(1)
+            }
+        };
+    }
 
     let cli = Cli::parse();
     let debug = cli.debug;

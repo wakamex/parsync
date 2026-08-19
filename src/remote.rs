@@ -288,8 +288,7 @@ pub struct SshRemote {
 impl SshRemote {
     pub fn connect(spec: RemoteSpec, pool_size: usize) -> Result<Self> {
         let star_children_mode = spec.path_trailing_star;
-        let target = resolve_connect_target(&spec)?;
-        let pool = Arc::new(ConnectionPool::new(target, pool_size.max(1))?);
+        let pool = Arc::new(ConnectionPool::connect(&spec, pool_size.max(1))?);
         let root_path = PathBuf::from(spec.path.clone());
 
         let root_stat = {
@@ -1143,6 +1142,80 @@ impl Connection {
         })
     }
 
+    fn create_dir_all(&mut self, path: &Path) -> Result<()> {
+        let mut current = PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::RootDir => {
+                    current.push("/");
+                }
+                std::path::Component::Normal(part) => {
+                    current.push(part);
+                    if self.sftp.mkdir(&current, 0o755).is_err() {
+                        if let Ok(stat) = self.sftp.stat(&current) {
+                            if stat.is_dir() {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn rename(&mut self, src: &Path, dst: &Path) -> Result<()> {
+        self.sftp
+            .rename(src, dst, None)
+            .with_context(|| format!("sftp rename failed: {} -> {}", src.display(), dst.display()))
+    }
+
+    fn upload_file(
+        &mut self,
+        local_path: &Path,
+        temp_path: &Path,
+        final_path: &Path,
+        fsync: bool,
+    ) -> Result<u64> {
+        let mut local_file = fs::File::open(local_path)
+            .with_context(|| format!("open local source file: {}", local_path.display()))?;
+        let mut remote_file = self
+            .sftp
+            .create(temp_path)
+            .with_context(|| format!("create remote temporary file: {}", temp_path.display()))?;
+
+        let mut buffer = [0u8; 64 * 1024];
+        let mut total_bytes = 0u64;
+        loop {
+            let read_bytes = local_file
+                .read(&mut buffer)
+                .with_context(|| format!("read local file: {}", local_path.display()))?;
+            if read_bytes == 0 {
+                break;
+            }
+            remote_file
+                .write_all(&buffer[..read_bytes])
+                .with_context(|| format!("write to remote file: {}", temp_path.display()))?;
+            total_bytes += read_bytes as u64;
+        }
+
+        if fsync {
+            let _ = remote_file.fsync();
+        }
+        drop(remote_file);
+
+        self.rename(temp_path, final_path).with_context(|| {
+            format!(
+                "rename remote file: {} -> {}",
+                temp_path.display(),
+                final_path.display()
+            )
+        })?;
+
+        Ok(total_bytes)
+    }
+
     fn readdir(&mut self, path: &Path) -> Result<Vec<(PathBuf, FileStat)>> {
         self.sftp
             .readdir(path)
@@ -1445,7 +1518,7 @@ fn try_pubkey_files(session: &Session, user: &str, configured: &[PathBuf]) -> Re
     Ok(false)
 }
 
-struct ConnectionPool {
+pub(crate) struct ConnectionPool {
     target: ConnectTarget,
     inner: Mutex<PoolState>,
     condvar: Condvar,
@@ -1458,7 +1531,8 @@ struct PoolState {
 }
 
 impl ConnectionPool {
-    fn new(target: ConnectTarget, pool_size: usize) -> Result<Self> {
+    pub(crate) fn connect(spec: &RemoteSpec, pool_size: usize) -> Result<Self> {
+        let target = resolve_connect_target(spec)?;
         // Eagerly open one connection for fast-fail auth/host errors,
         // then grow lazily as workers request more connections.
         let first = vec![Connection::connect(&target)?];
@@ -1478,7 +1552,7 @@ impl ConnectionPool {
         Connection::connect(&self.target)
     }
 
-    fn checkout(&self) -> Result<PooledConnection<'_>> {
+    pub(crate) fn checkout(&self) -> Result<PooledConnection<'_>> {
         let mut locked = self
             .inner
             .lock()
@@ -1530,7 +1604,7 @@ impl ConnectionPool {
     }
 }
 
-struct PooledConnection<'a> {
+pub(crate) struct PooledConnection<'a> {
     pool: &'a ConnectionPool,
     conn: Option<Connection>,
 }
@@ -1538,6 +1612,26 @@ struct PooledConnection<'a> {
 impl<'a> PooledConnection<'a> {
     fn replace(&mut self, conn: Connection) {
         self.conn = Some(conn);
+    }
+
+    pub(crate) fn create_dir_all(&mut self, path: &Path) -> Result<()> {
+        self.conn
+            .as_mut()
+            .ok_or_else(|| anyhow!("missing pooled connection"))?
+            .create_dir_all(path)
+    }
+
+    pub(crate) fn upload_file(
+        &mut self,
+        local_path: &Path,
+        temp_path: &Path,
+        final_path: &Path,
+        fsync: bool,
+    ) -> Result<u64> {
+        self.conn
+            .as_mut()
+            .ok_or_else(|| anyhow!("missing pooled connection"))?
+            .upload_file(local_path, temp_path, final_path, fsync)
     }
 
     fn readdir(&mut self, path: &Path) -> Result<Vec<(PathBuf, FileStat)>> {
