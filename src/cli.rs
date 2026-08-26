@@ -163,11 +163,11 @@ pub struct Cli {
     #[arg(long = "strict-windows-metadata", action = ArgAction::SetTrue)]
     pub strict_windows_metadata: bool,
 
-    /// Source path or SSH remote source spec: local path or `[user@]host[:port]:path`
-    pub remote_source: String,
+    /// Source path or SSH source: local path or `[user@]host[:port]:path`
+    pub source: String,
 
-    /// Local destination path
-    pub local_destination: std::path::PathBuf,
+    /// Destination path or SSH destination: local path or `[user@]host[:port]:path`
+    pub destination: String,
 }
 
 impl Cli {

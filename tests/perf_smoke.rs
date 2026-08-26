@@ -107,6 +107,7 @@ fn opts(jobs: usize) -> SyncOptions {
         preserve_acls: false,
         preserve_xattrs: false,
         jobs,
+        jobs_explicit: true,
         chunk_size: 64 * 1024,
         chunk_threshold: 64 * 1024,
         retries: 2,

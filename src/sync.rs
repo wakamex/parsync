@@ -31,13 +31,13 @@ use crate::{
     delta::{apply_delta_ops, build_signature, choose_block_size, BlockSig},
     hashing::{format_digest, hash_file},
     remote::{
-        parse_source_spec, EntryKind, LocalFsRemote, RemoteClient, RemoteEntry, SourceSpec,
-        SshRemote,
+        parse_destination_spec, parse_source_spec, DestinationSpec, EntryKind, LocalFsRemote,
+        RemoteClient, RemoteEntry, SourceSpec, SshRemote,
     },
     state::{acquire_destination_lock, DeltaSessionState, StateStore},
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RunSummary {
     pub transferred_files: u64,
     pub skipped_files: u64,
@@ -73,6 +73,7 @@ pub struct SyncOptions {
     pub preserve_acls: bool,
     pub preserve_xattrs: bool,
     pub jobs: usize,
+    pub jobs_explicit: bool,
     pub chunk_size: u64,
     pub chunk_threshold: u64,
     pub retries: usize,
@@ -116,6 +117,7 @@ impl SyncOptions {
             preserve_acls: cli.preserve_acls,
             preserve_xattrs: cli.preserve_xattrs,
             jobs: resolved.jobs,
+            jobs_explicit: resolved.jobs_explicit,
             chunk_size: resolved.chunk_size,
             chunk_threshold: resolved.chunk_threshold,
             retries: resolved.retries,
@@ -187,8 +189,8 @@ pub fn run_sync(cli: Cli) -> Result<RunSummary> {
     let options = SyncOptions::from_cli(&cli)?;
     let start_message = format!(
         "starting sync source={} dest={} jobs={} chunk_size={} threshold={} resume={} strict_durability={} verify_existing={} sftp_read_concurrency={} sftp_read_chunk_size={}",
-        cli.remote_source,
-        cli.local_destination.display(),
+        cli.source,
+        cli.destination,
         options.jobs,
         options.chunk_size,
         options.chunk_threshold,
@@ -209,16 +211,18 @@ pub fn run_sync(cli: Cli) -> Result<RunSummary> {
     );
     log_debug(&options, start_message);
 
-    match parse_source_spec(&cli.remote_source)? {
-        SourceSpec::Local(spec) => {
+    let source_spec = parse_source_spec(&cli.source)?;
+    let destination_spec = parse_destination_spec(&cli.destination)?;
+    match (source_spec, destination_spec) {
+        (SourceSpec::Local(spec), DestinationSpec::Local(destination)) => {
             log_debug(
                 &options,
                 format!("parsed local source path={}", spec.path.display()),
             );
             let remote = LocalFsRemote::connect(spec)?;
-            run_sync_with_client(&remote, &cli.local_destination, &options)
+            run_sync_with_client(&remote, &destination, &options)
         }
-        SourceSpec::Remote(spec) => {
+        (SourceSpec::Remote(spec), DestinationSpec::Local(destination)) => {
             log_debug(
                 &options,
                 format!(
@@ -235,7 +239,7 @@ pub fn run_sync(cli: Cli) -> Result<RunSummary> {
                 &options,
                 "stage=connecting: ssh connection pool established",
             );
-            let summary = run_sync_with_client(&remote, &cli.local_destination, &options)?;
+            let summary = run_sync_with_client(&remote, &destination, &options)?;
             let disconnect_started = Instant::now();
             log_debug(
                 &options,
@@ -250,6 +254,17 @@ pub fn run_sync(cli: Cli) -> Result<RunSummary> {
                 ),
             );
             Ok(summary)
+        }
+        (SourceSpec::Local(spec), DestinationSpec::Remote(destination)) => {
+            log_debug(
+                &options,
+                format!("parsed local source path={}", spec.path.display()),
+            );
+            let source = LocalFsRemote::connect(spec)?;
+            crate::push::run_push(&source, destination, &options)
+        }
+        (SourceSpec::Remote(_), DestinationSpec::Remote(_)) => {
+            bail!("remote-to-remote transfers are not supported")
         }
     }
 }
@@ -1412,7 +1427,7 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static INTERRUPT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SIGNAL_INIT: Once = Once::new();
 
-fn install_signal_handlers() -> Result<()> {
+pub(crate) fn install_signal_handlers() -> Result<()> {
     let mut setup_err: Option<anyhow::Error> = None;
     SIGNAL_INIT.call_once(|| {
         if let Err(err) = ctrlc::set_handler(|| {
@@ -1434,16 +1449,16 @@ fn install_signal_handlers() -> Result<()> {
     Ok(())
 }
 
-fn clear_interrupt_flag() {
+pub(crate) fn clear_interrupt_flag() {
     INTERRUPTED.store(false, Ordering::SeqCst);
     INTERRUPT_COUNT.store(0, Ordering::SeqCst);
 }
 
-fn is_interrupted() -> bool {
+pub(crate) fn is_interrupted() -> bool {
     INTERRUPTED.load(Ordering::SeqCst)
 }
 
-fn check_interrupted() -> Result<()> {
+pub(crate) fn check_interrupted() -> Result<()> {
     if is_interrupted() {
         bail!("interrupted by signal");
     }
@@ -2367,8 +2382,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             rdma_helper: None,
             strict_windows_metadata: false,
-            remote_source: source,
-            local_destination: destination,
+            source,
+            destination: destination.to_string_lossy().to_string(),
         }
     }
 
@@ -2386,6 +2401,7 @@ mod tests {
             preserve_acls: false,
             preserve_xattrs: false,
             jobs: 4,
+            jobs_explicit: true,
             chunk_size: 8,
             chunk_threshold: 8,
             retries: 2,

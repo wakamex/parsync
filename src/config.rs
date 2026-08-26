@@ -13,6 +13,7 @@ use crate::rdma::{RdmaMode, DEFAULT_RDMA_MIN_SIZE};
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
     pub jobs: usize,
+    pub jobs_explicit: bool,
     pub chunk_size: u64,
     pub chunk_threshold: u64,
     pub retries: usize,
@@ -72,9 +73,12 @@ impl ResolvedConfig {
     pub fn from_cli(cli: &Cli) -> Result<Self> {
         let file_cfg = load_file_config()?;
 
+        let env_jobs = env_parse::<usize>("PARSYNC_JOBS");
+        let jobs_explicit = cli.jobs.is_some() || env_jobs.is_some() || file_cfg.jobs.is_some();
+
         let jobs = cli
             .jobs
-            .or_else(|| env_parse::<usize>("PARSYNC_JOBS"))
+            .or(env_jobs)
             .or(file_cfg.jobs)
             .unwrap_or_else(Cli::default_jobs)
             .max(1);
@@ -214,6 +218,7 @@ impl ResolvedConfig {
 
         Ok(Self {
             jobs,
+            jobs_explicit,
             chunk_size,
             chunk_threshold,
             retries,

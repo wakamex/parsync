@@ -21,8 +21,10 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ssh2::{
-    CheckResult, File as SftpFile, FileStat, KnownHostFileKind, KnownHostKeyFormat, Session, Sftp,
+    CheckResult, ErrorCode, File as SftpFile, FileStat, KnownHostFileKind, KnownHostKeyFormat,
+    OpenFlags, OpenType, RenameFlags, Session, Sftp,
 };
+use xxhash_rust::xxh3::Xxh3;
 
 use crate::delta::{
     build_delta_ops,
@@ -50,6 +52,12 @@ pub enum SourceSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DestinationSpec {
+    Remote(RemoteSpec),
+    Local(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalSourceSpec {
     pub path: PathBuf,
     pub path_trailing_star: bool,
@@ -65,6 +73,18 @@ pub fn parse_source_spec(input: &str) -> Result<SourceSpec> {
     }
 
     Ok(SourceSpec::Remote(RemoteSpec::parse(input)?))
+}
+
+pub fn parse_destination_spec(input: &str) -> Result<DestinationSpec> {
+    if looks_like_local_source(input) {
+        return Ok(DestinationSpec::Local(PathBuf::from(input)));
+    }
+
+    let spec = RemoteSpec::parse(input)?;
+    if spec.path_trailing_star {
+        bail!("remote destination must not use a trailing /*")
+    }
+    Ok(DestinationSpec::Remote(spec))
 }
 
 impl LocalSourceSpec {
@@ -178,6 +198,24 @@ fn looks_like_local_source(input: &str) -> bool {
 
     !input.contains(':')
 }
+
+fn validate_relative_remote_path(path: &Path) -> Result<()> {
+    if path.is_absolute() {
+        bail!("destination entry has absolute path: {}", path.display());
+    }
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                bail!("unsafe destination path component in {}", path.display())
+            }
+            std::path::Component::CurDir | std::path::Component::Normal(_) => {}
+        }
+    }
+    Ok(())
+}
+
 fn normalize_source_path(raw: &str) -> Result<String> {
     if raw.ends_with("/*") {
         let trimmed = raw.trim_end_matches('*').trim_end_matches('/');
@@ -283,6 +321,168 @@ pub struct SshRemote {
     root_basename: PathBuf,
     star_children_mode: bool,
     pool: Arc<ConnectionPool>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DestinationEntry {
+    pub kind: EntryKind,
+    pub size: u64,
+    pub mtime_secs: i64,
+    pub link_target: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DestinationMetadata {
+    pub mtime_secs: i64,
+    pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SshDestination {
+    spec: RemoteSpec,
+    root_path: PathBuf,
+    pool: Arc<ConnectionPool>,
+}
+
+impl SshDestination {
+    pub(crate) fn connect(spec: RemoteSpec, pool_size: usize, create_root: bool) -> Result<Self> {
+        let target = resolve_connect_target(&spec)?;
+        let pool = Arc::new(ConnectionPool::new(target, pool_size.max(1))?);
+        let requested_root = PathBuf::from(&spec.path);
+
+        let root_path = {
+            let mut conn = pool.checkout()?;
+            match conn.lstat_optional(&requested_root)? {
+                Some(_) => {
+                    let stat = conn.stat(&requested_root)?;
+                    if !stat.is_dir() {
+                        bail!(
+                            "remote destination is not a directory: {}",
+                            requested_root.display()
+                        );
+                    }
+                    conn.realpath(&requested_root)?
+                }
+                None if create_root => {
+                    conn.create_dir_all(&requested_root, false)?;
+                    conn.realpath(&requested_root)?
+                }
+                None => requested_root,
+            }
+        };
+
+        Ok(Self {
+            spec,
+            root_path,
+            pool,
+        })
+    }
+
+    pub(crate) fn display_host(&self) -> String {
+        self.spec.display_host()
+    }
+
+    fn path_for(&self, relative_path: &Path) -> Result<PathBuf> {
+        validate_relative_remote_path(relative_path)?;
+        Ok(self.root_path.join(relative_path))
+    }
+
+    pub(crate) fn stat(&self, relative_path: &Path) -> Result<Option<DestinationEntry>> {
+        let path = self.path_for(relative_path)?;
+        let mut conn = self.pool.checkout()?;
+        let Some(stat) = conn.lstat_optional(&path)? else {
+            return Ok(None);
+        };
+        let kind = entry_kind_from_stat(&stat)?;
+        let link_target = if kind == EntryKind::Symlink {
+            Some(conn.readlink(&path)?)
+        } else {
+            None
+        };
+        Ok(Some(DestinationEntry {
+            kind,
+            size: stat.size.unwrap_or(0),
+            mtime_secs: stat.mtime.unwrap_or(0) as i64,
+            link_target,
+        }))
+    }
+
+    pub(crate) fn create_dir(&self, relative_path: &Path) -> Result<()> {
+        let path = self.path_for(relative_path)?;
+        let mut conn = self.pool.checkout()?;
+        conn.create_dir_all(&path, true)
+    }
+
+    pub(crate) fn set_metadata(
+        &self,
+        relative_path: &Path,
+        metadata: DestinationMetadata,
+    ) -> Result<()> {
+        let path = self.path_for(relative_path)?;
+        let mut conn = self.pool.checkout()?;
+        conn.set_metadata(&path, metadata)
+    }
+
+    pub(crate) fn create_or_replace_symlink(
+        &self,
+        relative_path: &Path,
+        link_target: &Path,
+    ) -> Result<()> {
+        let path = self.path_for(relative_path)?;
+        let mut conn = self.pool.checkout()?;
+        conn.create_or_replace_symlink(&path, link_target)
+    }
+
+    pub(crate) fn hash_file(&self, relative_path: &Path) -> Result<u128> {
+        let path = self.path_for(relative_path)?;
+        let mut conn = self.pool.checkout()?;
+        conn.hash_file(&path)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn upload_file(
+        &self,
+        local_path: &Path,
+        relative_path: &Path,
+        partial_name: &str,
+        backup_name: &str,
+        expected_size: u64,
+        expected_mtime_secs: i64,
+        resume: bool,
+        strict_durability: bool,
+        buffer_size: usize,
+        metadata: DestinationMetadata,
+        on_bytes: &(dyn Fn(u64) + Sync),
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<u64> {
+        let final_path = self.path_for(relative_path)?;
+        let parent = final_path
+            .parent()
+            .ok_or_else(|| anyhow!("remote file has no parent: {}", final_path.display()))?;
+        let partial_path = parent.join(partial_name);
+        let backup_path = parent.join(backup_name);
+        let mut conn = self.pool.checkout()?;
+        let result = conn.upload_file(
+            local_path,
+            &partial_path,
+            &final_path,
+            &backup_path,
+            expected_size,
+            expected_mtime_secs,
+            resume,
+            strict_durability,
+            buffer_size,
+            metadata,
+            on_bytes,
+            cancelled,
+        );
+        if result.is_err() {
+            conn.invalidate()?;
+        }
+        result
+    }
 }
 
 impl SshRemote {
@@ -551,7 +751,7 @@ impl LocalFsRemote {
         })
     }
 
-    fn local_path_for(&self, relative_path: &Path) -> PathBuf {
+    pub(crate) fn local_path_for(&self, relative_path: &Path) -> PathBuf {
         if self.root_kind != EntryKind::Dir {
             return self.root_path.clone();
         }
@@ -1143,6 +1343,377 @@ impl Connection {
         })
     }
 
+    fn lstat_optional(&mut self, path: &Path) -> Result<Option<FileStat>> {
+        match self.sftp.lstat(path) {
+            Ok(stat) => Ok(Some(stat)),
+            Err(err) if err.code() == ErrorCode::SFTP(2) => Ok(None),
+            Err(err) => Err(err).with_context(|| format!("sftp lstat failed: {}", path.display())),
+        }
+    }
+
+    fn stat(&mut self, path: &Path) -> Result<FileStat> {
+        self.sftp
+            .stat(path)
+            .with_context(|| format!("sftp stat failed: {}", path.display()))
+    }
+
+    fn realpath(&mut self, path: &Path) -> Result<PathBuf> {
+        self.sftp
+            .realpath(path)
+            .with_context(|| format!("sftp realpath failed: {}", path.display()))
+    }
+
+    fn create_dir_all(&mut self, path: &Path, reject_symlinks: bool) -> Result<()> {
+        let mut current = PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::RootDir => {
+                    current.push("/");
+                    continue;
+                }
+                std::path::Component::CurDir => continue,
+                std::path::Component::Normal(part) => current.push(part),
+                std::path::Component::ParentDir | std::path::Component::Prefix(_) => {
+                    bail!("unsafe remote directory path: {}", path.display())
+                }
+            }
+
+            match self.lstat_optional(&current)? {
+                Some(stat) if stat.is_dir() => continue,
+                Some(stat)
+                    if !reject_symlinks
+                        && stat.file_type().is_symlink()
+                        && self.stat(&current).is_ok_and(|target| target.is_dir()) =>
+                {
+                    continue;
+                }
+                Some(_) => {
+                    bail!(
+                        "remote destination path component is not a directory: {}",
+                        current.display()
+                    )
+                }
+                None => {
+                    if let Err(create_err) = self.sftp.mkdir(&current, 0o755) {
+                        if self
+                            .lstat_optional(&current)?
+                            .is_some_and(|stat| stat.is_dir())
+                        {
+                            continue;
+                        }
+                        return Err(create_err).with_context(|| {
+                            format!("create remote directory: {}", current.display())
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn set_metadata(&mut self, path: &Path, metadata: DestinationMetadata) -> Result<()> {
+        let current = self
+            .lstat_optional(path)?
+            .ok_or_else(|| anyhow!("remote path disappeared: {}", path.display()))?;
+        let preserve_identity = metadata.uid.is_some() || metadata.gid.is_some();
+        let mtime = metadata.mtime_secs.max(0) as u64;
+        self.sftp
+            .setstat(
+                path,
+                FileStat {
+                    size: None,
+                    uid: preserve_identity
+                        .then(|| metadata.uid.or(current.uid))
+                        .flatten(),
+                    gid: preserve_identity
+                        .then(|| metadata.gid.or(current.gid))
+                        .flatten(),
+                    perm: metadata.mode,
+                    atime: Some(current.atime.unwrap_or(mtime)),
+                    mtime: Some(mtime),
+                },
+            )
+            .with_context(|| format!("set remote metadata: {}", path.display()))
+    }
+
+    fn create_or_replace_symlink(&mut self, path: &Path, link_target: &Path) -> Result<()> {
+        if let Some(existing) = self.lstat_optional(path)? {
+            if existing.is_dir() {
+                bail!(
+                    "refusing to replace existing remote directory with a symlink: {}",
+                    path.display()
+                );
+            }
+            self.sftp
+                .unlink(path)
+                .with_context(|| format!("remove existing remote path: {}", path.display()))?;
+        }
+        self.sftp.symlink(link_target, path).with_context(|| {
+            format!(
+                "create remote symlink {} -> {}",
+                path.display(),
+                link_target.display()
+            )
+        })
+    }
+
+    fn hash_file(&mut self, path: &Path) -> Result<u128> {
+        let mut file = self
+            .sftp
+            .open(path)
+            .with_context(|| format!("open remote file for verification: {}", path.display()))?;
+        let mut hasher = Xxh3::new();
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            let count = file.read(&mut buffer).with_context(|| {
+                format!("read remote file for verification: {}", path.display())
+            })?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        Ok(hasher.digest128())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upload_file(
+        &mut self,
+        local_path: &Path,
+        partial_path: &Path,
+        final_path: &Path,
+        backup_path: &Path,
+        expected_size: u64,
+        expected_mtime_secs: i64,
+        resume: bool,
+        strict_durability: bool,
+        buffer_size: usize,
+        metadata: DestinationMetadata,
+        on_bytes: &(dyn Fn(u64) + Sync),
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<u64> {
+        if cancelled() {
+            bail!("interrupted by signal");
+        }
+
+        self.recover_backup(final_path, backup_path)?;
+
+        let mut offset = 0_u64;
+        if let Some(partial) = self.lstat_optional(partial_path)? {
+            if !partial.is_file() {
+                bail!(
+                    "remote partial path is not a regular file: {}",
+                    partial_path.display()
+                );
+            }
+            if resume && partial.size.unwrap_or(0) <= expected_size {
+                offset = partial.size.unwrap_or(0);
+            } else {
+                self.sftp.unlink(partial_path).with_context(|| {
+                    format!("remove stale remote partial: {}", partial_path.display())
+                })?;
+            }
+        }
+
+        let mut local_file = fs::File::open(local_path)
+            .with_context(|| format!("open local source file: {}", local_path.display()))?;
+        local_file
+            .seek(SeekFrom::Start(offset))
+            .with_context(|| format!("seek local source file: {}", local_path.display()))?;
+
+        let open_flags = if offset == 0 {
+            OpenFlags::WRITE | OpenFlags::TRUNCATE
+        } else {
+            OpenFlags::WRITE | OpenFlags::CREATE
+        };
+        let create_mode = metadata.mode.unwrap_or(0o644) as i32;
+        let mut remote_file = self
+            .sftp
+            .open_mode(partial_path, open_flags, create_mode, OpenType::File)
+            .with_context(|| format!("open remote partial file: {}", partial_path.display()))?;
+        remote_file
+            .seek(SeekFrom::Start(offset))
+            .with_context(|| format!("seek remote partial file: {}", partial_path.display()))?;
+
+        on_bytes(offset);
+        let mut transferred = 0_u64;
+        let mut buffer = vec![0_u8; buffer_size.max(1)];
+        loop {
+            if cancelled() {
+                bail!("interrupted by signal");
+            }
+            let count = local_file
+                .read(&mut buffer)
+                .with_context(|| format!("read local source file: {}", local_path.display()))?;
+            if count == 0 {
+                break;
+            }
+            remote_file
+                .write_all(&buffer[..count])
+                .with_context(|| format!("write remote partial: {}", partial_path.display()))?;
+            transferred += count as u64;
+            on_bytes(offset.saturating_add(transferred));
+        }
+
+        if offset.saturating_add(transferred) != expected_size {
+            bail!(
+                "local source size changed during transfer: {} (expected {}, read {})",
+                local_path.display(),
+                expected_size,
+                offset.saturating_add(transferred)
+            );
+        }
+
+        let latest = fs::symlink_metadata(local_path)
+            .with_context(|| format!("restat local source file: {}", local_path.display()))?;
+        let latest_mtime = metadata_mtime_secs(&latest);
+        if latest.len() != expected_size || latest_mtime != expected_mtime_secs {
+            bail!(
+                "local source changed during transfer: {} (expected size={} mtime={}, got size={} mtime={})",
+                local_path.display(),
+                expected_size,
+                expected_mtime_secs,
+                latest.len(),
+                latest_mtime
+            );
+        }
+
+        if strict_durability {
+            remote_file
+                .fsync()
+                .with_context(|| format!("fsync remote partial: {}", partial_path.display()))?;
+        }
+        drop(remote_file);
+
+        self.set_metadata(partial_path, metadata)?;
+        self.commit_file(partial_path, final_path, backup_path)?;
+        Ok(transferred)
+    }
+
+    fn recover_backup(&mut self, final_path: &Path, backup_path: &Path) -> Result<()> {
+        let Some(backup) = self.lstat_optional(backup_path)? else {
+            return Ok(());
+        };
+        if backup.is_dir() {
+            bail!(
+                "remote backup path is a directory: {}",
+                backup_path.display()
+            );
+        }
+
+        if self.lstat_optional(final_path)?.is_some() {
+            self.sftp.unlink(backup_path).with_context(|| {
+                format!("remove stale remote backup: {}", backup_path.display())
+            })?;
+        } else {
+            self.sftp
+                .rename(backup_path, final_path, Some(RenameFlags::empty()))
+                .with_context(|| {
+                    format!(
+                        "restore remote backup {} to {}",
+                        backup_path.display(),
+                        final_path.display()
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    fn commit_file(
+        &mut self,
+        partial_path: &Path,
+        final_path: &Path,
+        backup_path: &Path,
+    ) -> Result<()> {
+        let atomic_error = match self.sftp.rename(partial_path, final_path, None) {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+
+        let partial = self.lstat_optional(partial_path)?;
+        let final_entry = self.lstat_optional(final_path)?;
+        if partial.is_none() && final_entry.is_some() {
+            return Ok(());
+        }
+        if partial.is_none() {
+            return Err(atomic_error).with_context(|| {
+                format!(
+                    "commit remote partial {} to {}",
+                    partial_path.display(),
+                    final_path.display()
+                )
+            });
+        }
+
+        let Some(final_entry) = final_entry else {
+            return self
+                .sftp
+                .rename(partial_path, final_path, Some(RenameFlags::empty()))
+                .with_context(|| {
+                    format!(
+                        "commit remote partial {} to {} after atomic rename was unavailable",
+                        partial_path.display(),
+                        final_path.display()
+                    )
+                });
+        };
+        if final_entry.is_dir() {
+            bail!(
+                "refusing to replace existing remote directory with a file: {}",
+                final_path.display()
+            );
+        }
+
+        self.recover_backup(final_path, backup_path)?;
+        self.sftp
+            .rename(final_path, backup_path, Some(RenameFlags::empty()))
+            .with_context(|| {
+                format!(
+                    "move existing remote file {} to backup {}",
+                    final_path.display(),
+                    backup_path.display()
+                )
+            })?;
+
+        if let Err(commit_error) =
+            self.sftp
+                .rename(partial_path, final_path, Some(RenameFlags::empty()))
+        {
+            if self.lstat_optional(partial_path)?.is_none()
+                && self.lstat_optional(final_path)?.is_some()
+            {
+                let _ = self.sftp.unlink(backup_path);
+                return Ok(());
+            }
+
+            if self.lstat_optional(final_path)?.is_none() {
+                if let Err(restore_error) =
+                    self.sftp
+                        .rename(backup_path, final_path, Some(RenameFlags::empty()))
+                {
+                    bail!(
+                        "commit remote partial {} to {} failed: {}; restoring backup {} also failed: {}",
+                        partial_path.display(),
+                        final_path.display(),
+                        commit_error,
+                        backup_path.display(),
+                        restore_error
+                    );
+                }
+            }
+            return Err(commit_error).with_context(|| {
+                format!(
+                    "commit remote partial {} to {} after atomic rename was unavailable",
+                    partial_path.display(),
+                    final_path.display()
+                )
+            });
+        }
+
+        let _ = self.sftp.unlink(backup_path);
+        Ok(())
+    }
+
     fn readdir(&mut self, path: &Path) -> Result<Vec<(PathBuf, FileStat)>> {
         self.sftp
             .readdir(path)
@@ -1528,6 +2099,16 @@ impl ConnectionPool {
         self.condvar.notify_one();
         Ok(())
     }
+
+    fn discard_one(&self) -> Result<()> {
+        let mut locked = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow!("pool lock poisoned"))?;
+        locked.created = locked.created.saturating_sub(1);
+        self.condvar.notify_one();
+        Ok(())
+    }
 }
 
 struct PooledConnection<'a> {
@@ -1536,8 +2117,99 @@ struct PooledConnection<'a> {
 }
 
 impl<'a> PooledConnection<'a> {
+    fn invalidate(&mut self) -> Result<()> {
+        if self.conn.take().is_some() {
+            self.pool.discard_one()?;
+        }
+        Ok(())
+    }
+
     fn replace(&mut self, conn: Connection) {
         self.conn = Some(conn);
+    }
+
+    fn lstat_optional(&mut self, path: &Path) -> Result<Option<FileStat>> {
+        self.conn
+            .as_mut()
+            .ok_or_else(|| anyhow!("missing pooled connection"))?
+            .lstat_optional(path)
+    }
+
+    fn stat(&mut self, path: &Path) -> Result<FileStat> {
+        self.conn
+            .as_mut()
+            .ok_or_else(|| anyhow!("missing pooled connection"))?
+            .stat(path)
+    }
+
+    fn realpath(&mut self, path: &Path) -> Result<PathBuf> {
+        self.conn
+            .as_mut()
+            .ok_or_else(|| anyhow!("missing pooled connection"))?
+            .realpath(path)
+    }
+
+    fn create_dir_all(&mut self, path: &Path, reject_symlinks: bool) -> Result<()> {
+        self.conn
+            .as_mut()
+            .ok_or_else(|| anyhow!("missing pooled connection"))?
+            .create_dir_all(path, reject_symlinks)
+    }
+
+    fn set_metadata(&mut self, path: &Path, metadata: DestinationMetadata) -> Result<()> {
+        self.conn
+            .as_mut()
+            .ok_or_else(|| anyhow!("missing pooled connection"))?
+            .set_metadata(path, metadata)
+    }
+
+    fn create_or_replace_symlink(&mut self, path: &Path, target: &Path) -> Result<()> {
+        self.conn
+            .as_mut()
+            .ok_or_else(|| anyhow!("missing pooled connection"))?
+            .create_or_replace_symlink(path, target)
+    }
+
+    fn hash_file(&mut self, path: &Path) -> Result<u128> {
+        self.conn
+            .as_mut()
+            .ok_or_else(|| anyhow!("missing pooled connection"))?
+            .hash_file(path)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upload_file(
+        &mut self,
+        local_path: &Path,
+        partial_path: &Path,
+        final_path: &Path,
+        backup_path: &Path,
+        expected_size: u64,
+        expected_mtime_secs: i64,
+        resume: bool,
+        strict_durability: bool,
+        buffer_size: usize,
+        metadata: DestinationMetadata,
+        on_bytes: &(dyn Fn(u64) + Sync),
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<u64> {
+        self.conn
+            .as_mut()
+            .ok_or_else(|| anyhow!("missing pooled connection"))?
+            .upload_file(
+                local_path,
+                partial_path,
+                final_path,
+                backup_path,
+                expected_size,
+                expected_mtime_secs,
+                resume,
+                strict_durability,
+                buffer_size,
+                metadata,
+                on_bytes,
+                cancelled,
+            )
     }
 
     fn readdir(&mut self, path: &Path) -> Result<Vec<(PathBuf, FileStat)>> {
@@ -2255,12 +2927,13 @@ fn expand_identity_file(path: &Path, host: &str, user: &str, port: u16) -> PathB
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{collections::HashSet, path::PathBuf};
     use tempfile::TempDir;
 
     use super::{
-        glob_match, is_missing_remote_command, load_ssh_config_path, parse_macos_xattrs,
-        parse_source_spec, parse_ssh_config, parse_xattrs, LocalSourceSpec, RemoteSpec, SourceSpec,
+        glob_match, is_missing_remote_command, load_ssh_config_path, parse_destination_spec,
+        parse_macos_xattrs, parse_source_spec, parse_ssh_config, parse_xattrs, DestinationSpec,
+        LocalSourceSpec, RemoteSpec, SourceSpec,
     };
     #[cfg(unix)]
     use super::{parse_find_record, EntryKind};
@@ -2322,6 +2995,30 @@ mod tests {
     fn windows_style_path_is_treated_as_local() {
         let err = parse_source_spec(r"C:\ebooks").expect_err("must fail");
         assert!(format!("{err:#}").contains("local source path not found"));
+    }
+
+    #[test]
+    fn parses_remote_destination() {
+        let spec = parse_destination_spec("alice@example.com:/srv/data").expect("parse");
+        match spec {
+            DestinationSpec::Remote(remote) => assert_eq!(remote.host, "example.com"),
+            other => panic!("expected remote destination, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_nonexistent_local_destination() {
+        let spec = parse_destination_spec("missing-local-destination").expect("parse");
+        assert_eq!(
+            spec,
+            DestinationSpec::Local(PathBuf::from("missing-local-destination"))
+        );
+    }
+
+    #[test]
+    fn rejects_destination_trailing_star() {
+        let err = parse_destination_spec("example.com:/srv/data/*").expect_err("must fail");
+        assert!(format!("{err:#}").contains("must not use a trailing /*"));
     }
 
     #[test]

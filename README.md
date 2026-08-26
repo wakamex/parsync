@@ -54,6 +54,21 @@ parsync -vrPlu user@example.com:2222:/remote/path /local/destination
 
 SSH config host aliases are supported.
 
+Push local files to an SSH destination with the same source syntax:
+
+```bash
+parsync -vrPlu '/local/site/*' user@example.com:/remote/site
+```
+
+Local-to-SSH transfers use parallel SFTP workers and resume deterministic
+partial files after an interrupted upload. The default worker count is capped
+at 4 for small file sets and 8 for larger transfers to avoid overwhelming the
+SSH server. `--jobs` overrides that choice.
+
+Block-delta transfer and RDMA currently apply only when the source is remote.
+ACLs, xattrs, and strict durability are rejected for SSH destinations. A
+remote source and remote destination in the same command is not supported.
+
 ## RDMA fast path
 
 On Linux, SSH transfers can use a direct RDMA fast path for large whole-file
