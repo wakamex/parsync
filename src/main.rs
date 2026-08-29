@@ -26,11 +26,15 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
     let debug = cli.debug;
+    let show_transfer_report = (cli.progress() || cli.verbose) && !cli.dry_run;
     match parsync::run_sync(cli) {
         Ok(summary) => {
+            if show_transfer_report {
+                eprintln!("{}", summary.transfer_report());
+            }
             if debug {
                 eprintln!(
-                    "completed: transferred={}, skipped={}, skipped_symlinks={}, bytes={}, delta_files={}, delta_fallbacks={}, rdma_files={}, rdma_fallbacks={}, rdma_bytes={}, bytes_saved={}, listing_ms={}, planning_ms={}, read_ms={}, write_ms={}, finalize_ms={}, metadata_ms={}, state_commit_ms={}",
+                    "completed: transferred={}, skipped={}, skipped_symlinks={}, bytes={}, delta_files={}, delta_fallbacks={}, rdma_files={}, rdma_fallbacks={}, rdma_bytes={}, bytes_saved={}, listing_ms={}, planning_ms={}, transfer_elapsed_ms={}, read_ms={}, write_ms={}, finalize_ms={}, metadata_ms={}, state_commit_ms={}",
                     summary.transferred_files,
                     summary.skipped_files,
                     summary.skipped_symlinks,
@@ -43,6 +47,7 @@ fn main() -> ExitCode {
                     summary.bytes_saved,
                     summary.listing_ms,
                     summary.planning_ms,
+                    summary.transfer_elapsed_ms,
                     summary.transfer_read_ms,
                     summary.transfer_write_ms,
                     summary.transfer_finalize_ms,

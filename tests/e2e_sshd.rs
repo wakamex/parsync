@@ -240,6 +240,7 @@ fn e2e_push_over_sftp_replaces_and_skips_files() -> Result<()> {
         "{}",
         String::from_utf8_lossy(&replacement.stderr)
     );
+    assert!(String::from_utf8_lossy(&replacement.stderr).contains("/s aggregate"));
     let hello = docker_exec(&cid, &["cat", "/home/foo/upload/hello.txt"])?;
     assert_eq!(hello.stdout, b"replacement content");
 

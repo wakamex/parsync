@@ -88,3 +88,34 @@ fn push_delta_fails_before_connecting() {
         "--delta is not supported for local-to-SSH transfers yet",
     ));
 }
+
+#[test]
+fn progress_prints_persistent_aggregate_transfer_report() {
+    let source = tempfile::tempdir().expect("temp source");
+    let destination = tempfile::tempdir().expect("temp destination");
+    let source_file = source.path().join("file");
+    std::fs::write(&source_file, vec![b'x'; 1024]).expect("write source");
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("parsync"));
+    cmd.arg("-P").arg(&source_file).arg(destination.path());
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Transfer complete: 1 file, 1.00 KiB",
+        ))
+        .stderr(predicate::str::contains("/s aggregate"));
+}
+
+#[test]
+fn quiet_transfer_omits_aggregate_transfer_report() {
+    let source = tempfile::tempdir().expect("temp source");
+    let destination = tempfile::tempdir().expect("temp destination");
+    let source_file = source.path().join("file");
+    std::fs::write(&source_file, b"data").expect("write source");
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("parsync"));
+    cmd.arg(&source_file).arg(destination.path());
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains("Transfer complete:").not());
+}

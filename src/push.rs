@@ -278,6 +278,7 @@ pub(crate) fn run_push(
         transferred_files: transferred_files.load(Ordering::Relaxed),
         skipped_files,
         transferred_bytes: transferred_bytes.load(Ordering::Relaxed),
+        transfer_elapsed_ms: transfer_write_ms,
         verbose: options.verbose,
         listing_ms,
         planning_ms,

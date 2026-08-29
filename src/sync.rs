@@ -42,6 +42,7 @@ pub struct RunSummary {
     pub transferred_files: u64,
     pub skipped_files: u64,
     pub transferred_bytes: u64,
+    pub transfer_elapsed_ms: u64,
     pub verbose: bool,
     pub delta_files: u64,
     pub delta_fallback_files: u64,
@@ -57,6 +58,27 @@ pub struct RunSummary {
     pub metadata_ms: u64,
     pub state_commit_ms: u64,
     pub skipped_symlinks: u64,
+}
+
+impl RunSummary {
+    pub fn transfer_report(&self) -> String {
+        let elapsed_secs = (self.transfer_elapsed_ms as f64 / 1000.0).max(0.001);
+        let bytes_per_second = (self.transferred_bytes as f64 / elapsed_secs).round() as u64;
+        let file_label = if self.transferred_files == 1 {
+            "file"
+        } else {
+            "files"
+        };
+        format!(
+            "Transfer complete: {} {}, {} in {:.2}s ({}/s aggregate), {} skipped",
+            self.transferred_files,
+            file_label,
+            format_bytes_human(self.transferred_bytes),
+            self.transfer_elapsed_ms as f64 / 1000.0,
+            format_bytes_human(bytes_per_second),
+            self.skipped_files,
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -513,11 +535,13 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
     }
     drop(errs);
     ui.finish_all();
+    let transfer_elapsed_ms = transfer_started.elapsed().as_millis() as u64;
 
     let summary = RunSummary {
         transferred_files: transferred_files.load(Ordering::Relaxed),
         skipped_files: skipped,
         transferred_bytes: transferred_bytes.load(Ordering::Relaxed),
+        transfer_elapsed_ms,
         verbose: options.verbose,
         delta_files: delta_files.load(Ordering::Relaxed),
         delta_fallback_files: delta_fallback_files.load(Ordering::Relaxed),
@@ -538,7 +562,7 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
         options,
         format!(
             "transfer duration: {}",
-            format_duration_human(transfer_started.elapsed())
+            format_duration_human(Duration::from_millis(transfer_elapsed_ms))
         ),
     );
 
@@ -2149,7 +2173,23 @@ mod tests {
         remote::{EntryKind, RemoteClient, RemoteEntry, RemoteFileStat},
     };
 
-    use super::{run_sync, run_sync_with_client, SyncOptions};
+    use super::{run_sync, run_sync_with_client, RunSummary, SyncOptions};
+
+    #[test]
+    fn transfer_report_uses_wall_clock_aggregate_rate() {
+        let summary = RunSummary {
+            transferred_files: 4,
+            skipped_files: 2,
+            transferred_bytes: 8 * 1024 * 1024,
+            transfer_elapsed_ms: 2_000,
+            ..RunSummary::default()
+        };
+
+        assert_eq!(
+            summary.transfer_report(),
+            "Transfer complete: 4 files, 8.00 MiB in 2.00s (4.00 MiB/s aggregate), 2 skipped"
+        );
+    }
 
     #[derive(Debug)]
     struct MockRemote {
