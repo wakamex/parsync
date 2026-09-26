@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    fs, io,
+    net::{Shutdown, TcpListener, TcpStream},
     path::Path,
     process::{Command, Output},
     thread,
@@ -69,14 +70,43 @@ fn run_parsync(remote: &str, destination: &Path) -> Result<()> {
 }
 
 fn run_parsync_args(args: &[String]) -> Result<Output> {
+    run_parsync_args_with_password(args, "pass")
+}
+
+fn run_parsync_args_with_password(args: &[String], password: &str) -> Result<Output> {
     let home = tempfile::tempdir().context("temp home")?;
     Command::new(assert_cmd::cargo::cargo_bin!("parsync"))
         .args(args)
-        .env("PARSYNC_SSH_PASSWORD", "pass")
+        .env("PARSYNC_SSH_PASSWORD", password)
         .env("PARSYNC_ACCEPT_NEW_HOST_KEYS", "1")
         .env("HOME", home.path())
+        .env_remove("SSH_AUTH_SOCK")
         .output()
         .context("run parsync")
+}
+
+fn proxy_after_dropping_first_connection(
+    listener: TcpListener,
+    target: (String, u16),
+) -> io::Result<()> {
+    let (first, _) = listener.accept()?;
+    drop(first);
+
+    let (mut client, _) = listener.accept()?;
+    let mut upstream = TcpStream::connect(target)?;
+    let mut client_reader = client.try_clone()?;
+    let mut upstream_writer = upstream.try_clone()?;
+    let client_to_upstream = thread::spawn(move || -> io::Result<()> {
+        io::copy(&mut client_reader, &mut upstream_writer)?;
+        upstream_writer.shutdown(Shutdown::Write)
+    });
+
+    io::copy(&mut upstream, &mut client)?;
+    client.shutdown(Shutdown::Write)?;
+    client_to_upstream
+        .join()
+        .map_err(|_| io::Error::other("proxy forwarding thread panicked"))??;
+    Ok(())
 }
 
 fn docker_exec(container: &str, args: &[&str]) -> Result<Output> {
@@ -281,6 +311,117 @@ fn e2e_push_over_sftp_replaces_and_skips_files() -> Result<()> {
         .contains("remote destination path component is not a directory"));
     let escaped_file = docker_exec(&cid, &["test", "!", "-e", "/tmp/parsync-escape-test"])?;
     assert!(escaped_file.status.success());
+
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires docker"]
+fn e2e_initial_connection_retries_after_transport_drop() -> Result<()> {
+    if !docker_available() {
+        return Ok(());
+    }
+
+    let cid = docker_run(&[
+        "run",
+        "-d",
+        "-P",
+        "docker.io/atmoz/sftp",
+        "foo:pass:::upload",
+    ])?;
+    let _container = DockerContainer { id: cid.clone() };
+    let port_out = docker_run(&["port", &cid, "22/tcp"])?;
+    let port = parse_mapped_port(&port_out)?;
+
+    let destination = TempDir::new()?;
+    let direct_remote = format!("foo@127.0.0.1:{port}:/upload");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if run_parsync(&direct_remote, destination.path()).is_ok() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!("test SSH server did not become ready");
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let proxy_port = listener.local_addr()?.port();
+    let proxy = thread::spawn(move || {
+        proxy_after_dropping_first_connection(listener, ("127.0.0.1".to_string(), port))
+    });
+    let proxied_remote = format!("foo@127.0.0.1:{proxy_port}:/upload");
+    let args = vec![
+        "-r".to_string(),
+        "--dry-run".to_string(),
+        "--jobs".to_string(),
+        "1".to_string(),
+        proxied_remote,
+        destination.path().display().to_string(),
+    ];
+    let output = run_parsync_args(&args)?;
+    proxy
+        .join()
+        .map_err(|_| anyhow!("proxy thread panicked"))??;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("initial SSH connection attempt 1/3 failed"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("retrying in 200 ms"), "{stderr}");
+
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires docker"]
+fn e2e_auth_failure_reports_methods_without_password_contents() -> Result<()> {
+    if !docker_available() {
+        return Ok(());
+    }
+
+    let cid = docker_run(&[
+        "run",
+        "-d",
+        "-P",
+        "docker.io/atmoz/sftp",
+        "foo:pass:::upload",
+    ])?;
+    let _container = DockerContainer { id: cid.clone() };
+    let port_out = docker_run(&["port", &cid, "22/tcp"])?;
+    let port = parse_mapped_port(&port_out)?;
+    let remote = format!("foo@127.0.0.1:{port}:/upload");
+    let destination = TempDir::new()?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if run_parsync(&remote, destination.path()).is_ok() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!("test SSH server did not become ready");
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    let secret = "password-that-must-not-appear";
+    let args = vec![
+        "-r".to_string(),
+        "--dry-run".to_string(),
+        remote,
+        destination.path().display().to_string(),
+    ];
+    let output = run_parsync_args_with_password(&args, secret)?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "authentication should fail");
+    assert!(stderr.contains("method results:"), "{stderr}");
+    assert!(stderr.contains("agent:"), "{stderr}");
+    assert!(stderr.contains("password:"), "{stderr}");
+    assert!(!stderr.contains(secret), "{stderr}");
 
     Ok(())
 }

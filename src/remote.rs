@@ -34,6 +34,7 @@ use crate::delta::{
 use crate::rdma::{self, RdmaCopyResult, RdmaReceiver, RdmaSendReport, RdmaTransferOptions};
 
 const REMOTE_SPEC_FORMAT: &str = "remote must be in format [user@]host[:port]:path";
+const INITIAL_CONNECT_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteSpec {
@@ -1946,51 +1947,105 @@ fn known_hosts_path() -> Result<PathBuf> {
 }
 
 fn authenticate_session(session: &Session, target: &ConnectTarget) -> Result<()> {
-    if session.userauth_agent(&target.user).is_ok() && session.authenticated() {
+    let mut method_results = Vec::new();
+
+    if authentication_succeeded(
+        session,
+        "agent",
+        session.userauth_agent(&target.user),
+        &mut method_results,
+    ) {
         return Ok(());
     }
 
-    if try_pubkey_files(session, &target.user, &target.identity_files)? && session.authenticated() {
+    if try_pubkey_files(
+        session,
+        &target.user,
+        &target.identity_files,
+        &mut method_results,
+    ) {
         return Ok(());
     }
 
-    if let Ok(password) = std::env::var("PARSYNC_SSH_PASSWORD") {
-        if session.userauth_password(&target.user, &password).is_ok() && session.authenticated() {
-            return Ok(());
+    match std::env::var("PARSYNC_SSH_PASSWORD") {
+        Ok(password) => {
+            if authentication_succeeded(
+                session,
+                "password",
+                session.userauth_password(&target.user, &password),
+                &mut method_results,
+            ) {
+                return Ok(());
+            }
         }
+        Err(_) => method_results.push("password: not configured".to_string()),
     }
 
     bail!(
-        "ssh authentication failed for {}@{}:{} (tried agent, configured/default keys, PARSYNC_SSH_PASSWORD)",
+        "ssh authentication failed for {}@{}:{}; method results: {}",
         target.user,
         target.host,
-        target.port
+        target.port,
+        method_results.join("; ")
     )
 }
 
-fn try_pubkey_files(session: &Session, user: &str, configured: &[PathBuf]) -> Result<bool> {
+fn authentication_succeeded(
+    session: &Session,
+    method: &str,
+    result: std::result::Result<(), ssh2::Error>,
+    method_results: &mut Vec<String>,
+) -> bool {
+    match result {
+        Ok(()) if session.authenticated() => true,
+        Ok(()) => {
+            method_results.push(format!(
+                "{method}: method returned success without authenticating the session"
+            ));
+            false
+        }
+        Err(error) => {
+            method_results.push(format!("{method}: {error}"));
+            false
+        }
+    }
+}
+
+fn try_pubkey_files(
+    session: &Session,
+    user: &str,
+    configured: &[PathBuf],
+    method_results: &mut Vec<String>,
+) -> bool {
+    let mut attempted_key = false;
     for private in configured {
         if !private.exists() {
+            method_results.push(format!("configured key {}: not found", private.display()));
             continue;
         }
+        attempted_key = true;
         let public = private.with_extension("pub");
         let public_ref = if public.exists() {
             Some(public.as_path())
         } else {
             None
         };
-        if session
-            .userauth_pubkey_file(user, public_ref, private, None)
-            .is_ok()
-            && session.authenticated()
-        {
-            return Ok(true);
+        if authentication_succeeded(
+            session,
+            &format!("configured key {}", private.display()),
+            session.userauth_pubkey_file(user, public_ref, private, None),
+            method_results,
+        ) {
+            return true;
         }
     }
 
     let home = match std::env::var("HOME") {
         Ok(v) => v,
-        Err(_) => return Ok(false),
+        Err(_) => {
+            method_results.push("default keys: HOME is not set".to_string());
+            return false;
+        }
     };
     let defaults = ["id_ed25519", "id_rsa"];
     for key in defaults {
@@ -1998,22 +2053,63 @@ fn try_pubkey_files(session: &Session, user: &str, configured: &[PathBuf]) -> Re
         if !private.exists() {
             continue;
         }
+        attempted_key = true;
         let public = private.with_extension("pub");
         let public_ref = if public.exists() {
             Some(public.as_path())
         } else {
             None
         };
-        if session
-            .userauth_pubkey_file(user, public_ref, &private, None)
-            .is_ok()
-            && session.authenticated()
-        {
-            return Ok(true);
+        if authentication_succeeded(
+            session,
+            &format!("default key {}", private.display()),
+            session.userauth_pubkey_file(user, public_ref, &private, None),
+            method_results,
+        ) {
+            return true;
         }
     }
 
-    Ok(false)
+    if !attempted_key {
+        method_results.push("key files: no configured or default private keys found".to_string());
+    }
+
+    false
+}
+
+fn initial_connect_retry_delay(failed_attempt: usize) -> std::time::Duration {
+    let milliseconds = match failed_attempt {
+        1 => 200,
+        _ => 500,
+    };
+    std::time::Duration::from_millis(milliseconds)
+}
+
+fn retry_initial_connection<T>(
+    mut connect: impl FnMut() -> Result<T>,
+    mut on_retry: impl FnMut(usize, std::time::Duration, &str),
+) -> Result<T> {
+    let mut failures = Vec::new();
+    for attempt in 1..=INITIAL_CONNECT_ATTEMPTS {
+        match connect() {
+            Ok(connection) => return Ok(connection),
+            Err(error) => {
+                let detail = format!("{error:#}");
+                failures.push(format!("attempt {attempt}: {detail}"));
+                if attempt == INITIAL_CONNECT_ATTEMPTS {
+                    bail!(
+                        "initial SSH connection failed after {INITIAL_CONNECT_ATTEMPTS} attempts: {}",
+                        failures.join(" | ")
+                    );
+                }
+
+                let delay = initial_connect_retry_delay(attempt);
+                on_retry(attempt, delay, &detail);
+            }
+        }
+    }
+
+    unreachable!("initial SSH connection retry loop always returns")
 }
 
 struct ConnectionPool {
@@ -2032,7 +2128,16 @@ impl ConnectionPool {
     fn new(target: ConnectTarget, pool_size: usize) -> Result<Self> {
         // Eagerly open one connection for fast-fail auth/host errors,
         // then grow lazily as workers request more connections.
-        let first = vec![Connection::connect(&target)?];
+        let first = vec![retry_initial_connection(
+            || Connection::connect(&target),
+            |attempt, delay, error| {
+                eprintln!(
+                    "[parsync][warn] initial SSH connection attempt {attempt}/{INITIAL_CONNECT_ATTEMPTS} failed: {error}; retrying in {} ms",
+                    delay.as_millis()
+                );
+                std::thread::sleep(delay);
+            },
+        )?];
         let pool = Self {
             target,
             inner: Mutex::new(PoolState {
@@ -2927,13 +3032,13 @@ fn expand_identity_file(path: &Path, host: &str, user: &str, port: u16) -> PathB
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, path::PathBuf};
+    use std::{collections::HashSet, path::PathBuf, time::Duration};
     use tempfile::TempDir;
 
     use super::{
         glob_match, is_missing_remote_command, load_ssh_config_path, parse_destination_spec,
-        parse_macos_xattrs, parse_source_spec, parse_ssh_config, parse_xattrs, DestinationSpec,
-        LocalSourceSpec, RemoteSpec, SourceSpec,
+        parse_macos_xattrs, parse_source_spec, parse_ssh_config, parse_xattrs,
+        retry_initial_connection, DestinationSpec, LocalSourceSpec, RemoteSpec, SourceSpec,
     };
     #[cfg(unix)]
     use super::{parse_find_record, EntryKind};
@@ -3184,5 +3289,47 @@ mod tests {
         assert_eq!(resolved.hostname.as_deref(), Some("example.org"));
         assert_eq!(resolved.user.as_deref(), Some("alice"));
         assert_eq!(resolved.port, Some(2222));
+    }
+
+    #[test]
+    fn initial_connection_retries_twice_with_bounded_backoff() {
+        let mut attempts = 0;
+        let mut retries = Vec::new();
+        let connected = retry_initial_connection(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    anyhow::bail!("transient failure {attempts}");
+                }
+                Ok("connected")
+            },
+            |attempt, delay, error| retries.push((attempt, delay, error.to_string())),
+        )
+        .expect("third attempt succeeds");
+
+        assert_eq!(connected, "connected");
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            retries,
+            vec![
+                (1, Duration::from_millis(200), "transient failure 1".into()),
+                (2, Duration::from_millis(500), "transient failure 2".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn initial_connection_failure_preserves_every_attempt_error() {
+        let error = retry_initial_connection::<()>(
+            || anyhow::bail!("authentication layer detail"),
+            |_, _, _| {},
+        )
+        .expect_err("all attempts fail");
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains("initial SSH connection failed after 3 attempts"));
+        assert!(rendered.contains("attempt 1: authentication layer detail"));
+        assert!(rendered.contains("attempt 2: authentication layer detail"));
+        assert!(rendered.contains("attempt 3: authentication layer detail"));
     }
 }
