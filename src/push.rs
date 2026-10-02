@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -91,17 +92,38 @@ pub(crate) fn run_push(
         .collect();
     directories.sort_by_key(|entry| entry.relative_path.components().count());
 
+    let rayon_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(jobs)
+        .build()
+        .context("build push thread pool")?;
+
     if !options.dry_run {
-        for directory in &directories {
+        // Directories are sorted by depth, so each one's parent is either the verified root or a
+        // directory created or checked at the previous depth; one depth runs in parallel.
+        let mut verified: HashSet<PathBuf> = HashSet::new();
+        for level in directories.chunk_by(|left, right| {
+            left.relative_path.components().count() == right.relative_path.components().count()
+        }) {
             check_interrupted()?;
-            destination
-                .create_dir(&directory.relative_path)
-                .with_context(|| {
-                    format!(
-                        "create remote directory: {}",
-                        directory.relative_path.display()
-                    )
-                })?;
+            rayon_pool.install(|| {
+                level.par_iter().try_for_each(|directory| {
+                    let path = &directory.relative_path;
+                    let parent_verified = path.parent().is_none_or(|parent| {
+                        parent.as_os_str().is_empty() || verified.contains(parent)
+                    });
+                    if parent_verified {
+                        destination.create_dir_in_verified_parent(path)
+                    } else {
+                        destination.create_dir(path)
+                    }
+                    .with_context(|| format!("create remote directory: {}", path.display()))
+                })
+            })?;
+            verified.extend(
+                level
+                    .iter()
+                    .map(|directory| directory.relative_path.clone()),
+            );
         }
     }
 
@@ -134,10 +156,6 @@ pub(crate) fn run_push(
         }
     }
 
-    let rayon_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(jobs)
-        .build()
-        .context("build push thread pool")?;
     let file_entries: Vec<RemoteEntry> = entries
         .into_iter()
         .filter(|entry| entry.kind == EntryKind::File)
@@ -264,12 +282,23 @@ pub(crate) fn run_push(
 
     let metadata_started = Instant::now();
     if !options.dry_run {
-        for directory in directories.iter().rev() {
+        // Deepest directories first; setting a directory's metadata never changes its parent's
+        // mtime, so each depth runs in parallel.
+        for level in directories
+            .chunk_by(|left, right| {
+                left.relative_path.components().count() == right.relative_path.components().count()
+            })
+            .rev()
+        {
             check_interrupted()?;
-            destination.set_metadata(
-                &directory.relative_path,
-                destination_metadata(directory, options)?,
-            )?;
+            rayon_pool.install(|| {
+                level.par_iter().try_for_each(|directory| {
+                    destination.set_metadata(
+                        &directory.relative_path,
+                        destination_metadata(directory, options)?,
+                    )
+                })
+            })?;
         }
     }
     let metadata_ms = metadata_started.elapsed().as_millis() as u64;

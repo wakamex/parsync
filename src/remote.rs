@@ -416,6 +416,14 @@ impl SshDestination {
         conn.create_dir_all(&path, true)
     }
 
+    /// Creates one directory whose parent the caller has already verified as a real directory,
+    /// costing a single lstat when it exists instead of one per path component.
+    pub(crate) fn create_dir_in_verified_parent(&self, relative_path: &Path) -> Result<()> {
+        let path = self.path_for(relative_path)?;
+        let mut conn = self.pool.checkout()?;
+        conn.create_dir_one(&path)
+    }
+
     pub(crate) fn set_metadata(
         &self,
         relative_path: &Path,
@@ -1412,12 +1420,41 @@ impl Connection {
         Ok(())
     }
 
+    fn create_dir_one(&mut self, path: &Path) -> Result<()> {
+        match self.lstat_optional(path)? {
+            Some(stat) if stat.is_dir() => Ok(()),
+            Some(_) => bail!(
+                "remote destination path component is not a directory: {}",
+                path.display()
+            ),
+            None => {
+                if let Err(create_err) = self.sftp.mkdir(path, 0o755) {
+                    if self.lstat_optional(path)?.is_some_and(|stat| stat.is_dir()) {
+                        return Ok(());
+                    }
+                    return Err(create_err)
+                        .with_context(|| format!("create remote directory: {}", path.display()));
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn set_metadata(&mut self, path: &Path, metadata: DestinationMetadata) -> Result<()> {
         let current = self
             .lstat_optional(path)?
             .ok_or_else(|| anyhow!("remote path disappeared: {}", path.display()))?;
         let preserve_identity = metadata.uid.is_some() || metadata.gid.is_some();
         let mtime = metadata.mtime_secs.max(0) as u64;
+        let unchanged = current.mtime == Some(mtime)
+            && metadata
+                .mode
+                .is_none_or(|mode| current.perm.map(|perm| perm & 0o7777) == Some(mode))
+            && metadata.uid.is_none_or(|uid| current.uid == Some(uid))
+            && metadata.gid.is_none_or(|gid| current.gid == Some(gid));
+        if unchanged {
+            return Ok(());
+        }
         self.sftp
             .setstat(
                 path,
@@ -2259,6 +2296,13 @@ impl<'a> PooledConnection<'a> {
             .as_mut()
             .ok_or_else(|| anyhow!("missing pooled connection"))?
             .create_dir_all(path, reject_symlinks)
+    }
+
+    fn create_dir_one(&mut self, path: &Path) -> Result<()> {
+        self.conn
+            .as_mut()
+            .ok_or_else(|| anyhow!("missing pooled connection"))?
+            .create_dir_one(path)
     }
 
     fn set_metadata(&mut self, path: &Path, metadata: DestinationMetadata) -> Result<()> {
